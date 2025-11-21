@@ -50,6 +50,9 @@ Webhooks possuem assinatura HMAC e tentativas automáticas.
 Banco em memória reinicia a cada execução.
 
 
+# Video Apresentação
+https://www.youtube.com/watch?v=oRxVzOKaCqw
+
 # PRINTS
 
 # Print - Inicialização

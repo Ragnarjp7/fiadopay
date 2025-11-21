@@ -42,6 +42,9 @@ curl http://localhost:8080/fiadopay/gateway/payments/<paymentId>
 # Observações
 
 Regras de antifraude são carregadas via reflexão em @AntiFraud.
+
 Pagamentos são processados em background com ExecutorService.
+
 Webhooks possuem assinatura HMAC e tentativas automáticas.
+
 Banco em memória reinicia a cada execução.

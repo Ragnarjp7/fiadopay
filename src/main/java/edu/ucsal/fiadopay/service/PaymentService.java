@@ -1,11 +1,14 @@
 package edu.ucsal.fiadopay.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import edu.ucsal.fiadopay.annotation.AntiFraud;
+import edu.ucsal.fiadopay.annotation.IdempotentOperation;
 import edu.ucsal.fiadopay.controller.PaymentRequest;
 import edu.ucsal.fiadopay.controller.PaymentResponse;
 import edu.ucsal.fiadopay.domain.Merchant;
 import edu.ucsal.fiadopay.domain.Payment;
 import edu.ucsal.fiadopay.domain.WebhookDelivery;
+import edu.ucsal.fiadopay.engine.AntiFraudReflectionEngine;
 import edu.ucsal.fiadopay.repo.MerchantRepository;
 import edu.ucsal.fiadopay.repo.PaymentRepository;
 import edu.ucsal.fiadopay.repo.WebhookDeliveryRepository;
@@ -25,24 +28,34 @@ import java.time.Instant;
 import java.util.Base64;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
 
 @Service
 public class PaymentService {
+
   private final MerchantRepository merchants;
   private final PaymentRepository payments;
   private final WebhookDeliveryRepository deliveries;
   private final ObjectMapper objectMapper;
+  private final AntiFraudReflectionEngine antiFraudEngine;
+  private final ExecutorService executor;
 
   @Value("${fiadopay.webhook-secret}") String secret;
   @Value("${fiadopay.processing-delay-ms}") long delay;
   @Value("${fiadopay.failure-rate}") double failRate;
 
-  public PaymentService(MerchantRepository merchants, PaymentRepository payments, WebhookDeliveryRepository deliveries, ObjectMapper objectMapper) {
+  public PaymentService(MerchantRepository merchants,
+                        PaymentRepository payments,
+                        WebhookDeliveryRepository deliveries,
+                        ObjectMapper objectMapper,
+                        AntiFraudReflectionEngine antiFraudEngine,
+                        ExecutorService paymentExecutor) {
     this.merchants = merchants;
     this.payments = payments;
     this.deliveries = deliveries;
     this.objectMapper = objectMapper;
+    this.antiFraudEngine = antiFraudEngine;
+    this.executor = paymentExecutor;
   }
 
   private Merchant merchantFromAuth(String auth){
@@ -51,9 +64,7 @@ public class PaymentService {
     }
     var raw = auth.substring("Bearer FAKE-".length());
     long id;
-    try {
-      id = Long.parseLong(raw);
-    } catch (NumberFormatException ex) {
+    try { id = Long.parseLong(raw); } catch (NumberFormatException ex) {
       throw new ResponseStatusException(HttpStatus.UNAUTHORIZED);
     }
     var merchant = merchants.findById(id).orElseThrow(() -> new ResponseStatusException(HttpStatus.UNAUTHORIZED));
@@ -63,6 +74,7 @@ public class PaymentService {
     return merchant;
   }
 
+  @IdempotentOperation(key = "Idempotency-Key")
   @Transactional
   public PaymentResponse createPayment(String auth, String idemKey, PaymentRequest req){
     var merchant = merchantFromAuth(auth);
@@ -100,7 +112,19 @@ public class PaymentService {
 
     payments.save(payment);
 
-    CompletableFuture.runAsync(() -> processAndWebhook(payment.getId()));
+    boolean suspect = antiFraudEngine.runChecks(payment);
+    if (suspect) {
+      payment.setStatus(Payment.Status.DECLINED);
+      payment.setUpdatedAt(Instant.now());
+      payments.save(payment);
+      executor.submit(() -> sendWebhook(payment));
+      return toResponse(payment);
+    }
+
+    payment.setStatus(Payment.Status.PENDING);
+    payments.save(payment);
+
+    executor.submit(() -> processAndWebhook(payment.getId()));
 
     return toResponse(payment);
   }
@@ -120,7 +144,7 @@ public class PaymentService {
     p.setStatus(Payment.Status.REFUNDED);
     p.setUpdatedAt(Instant.now());
     payments.save(p);
-    sendWebhook(p);
+    executor.submit(() -> sendWebhook(p));
     return Map.of("id","ref_"+UUID.randomUUID(),"status","PENDING");
   }
 
@@ -155,7 +179,6 @@ public class PaymentService {
       );
       payload = objectMapper.writeValueAsString(event);
     } catch (Exception e) {
-      // fallback mínimo: não envia webhook se falhar a serialização
       return;
     }
 
@@ -173,7 +196,7 @@ public class PaymentService {
         .lastAttemptAt(null)
         .build());
 
-    CompletableFuture.runAsync(() -> tryDeliver(delivery.getId()));
+    executor.submit(() -> tryDeliver(delivery.getId()));
   }
 
   private void tryDeliver(Long deliveryId){
@@ -224,5 +247,18 @@ public class PaymentService {
         p.getAmount(), p.getInstallments(), p.getMonthlyInterest(),
         p.getTotalWithInterest()
     );
+  }
+
+  @AntiFraud(name = "HighAmount", threshold = 1000.0)
+  public boolean ruleHighAmount(Payment p){
+    if (p.getTotalWithInterest()==null) return false;
+    try {
+      return p.getTotalWithInterest().doubleValue() > 1000.0;
+    } catch (Exception e) { return true; } // if type unexpected, be conservative
+  }
+
+  @AntiFraud(name = "BlockBoleto", threshold = 0.0)
+  public boolean ruleBlockBoleto(Payment p){
+    return "BOLETO".equalsIgnoreCase(p.getMethod()) && p.getAmount().doubleValue() > 5000.0;
   }
 }
